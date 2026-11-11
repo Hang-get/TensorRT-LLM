@@ -184,78 +184,58 @@ class LoraParamBuilder:
             }
         }
         """
-        lora_params = {}
-        tmp_lora_params = {}
-
         request_list = scheduled_requests.all_requests()
 
-        # trace all requests to get the union set of the lora params
+        # Read each adapter's configs once; requests that share an adapter share
+        # its row. Keys are the batch's (layer_id, module_id) pairs in first-seen order.
+        key_index: dict[tuple[int, int], int] = {}
+        task_rows: dict[int, int] = {}
+        task_entries: list[dict[int, tuple[int, int, int, int]]] = []
         for request in request_list:
-            if request.lora_task_id is None:
+            task_id = request.lora_task_id
+            if task_id is None or task_id in task_rows:
                 continue
-
-            layer_module_configs = peft_table[request.lora_task_id]
-
-            for module in layer_module_configs:
-                module_id = module.module_id
-                layer_id = module.layer_id
-
-                if layer_id not in lora_params:
-                    lora_params[layer_id] = {}
-                if module_id not in lora_params[layer_id]:
-                    lora_params[layer_id][module_id] = {
-                        "adapter_size": [],
-                        "weight_pointers": [],
-                    }
-
+            task_rows[task_id] = len(task_entries)
+            entries = {}
+            for module in peft_table[task_id]:
+                key = key_index.setdefault((module.layer_id, module.module_id), len(key_index))
                 scaling_vec_pointer = module.scaling_vec_pointer
                 if scaling_vec_pointer is None:
                     scaling_vec_pointer = 0
-                tmp_lora_params[(request.py_request_id, layer_id, module_id)] = {
-                    "adapter_size": [module.adapter_size],
-                    "weight_pointers": [
-                        module.weights_in_pointer,
-                        module.weights_out_pointer,
-                        scaling_vec_pointer,
-                    ],
+                entries[key] = (
+                    module.adapter_size,
+                    module.weights_in_pointer,
+                    module.weights_out_pointer,
+                    scaling_vec_pointer,
+                )
+            task_entries.append(entries)
+
+        lora_params = {}
+        if key_index:
+            num_keys = len(key_index)
+            no_adapter_row = len(task_entries)  # stays zero
+            adapter_sizes = torch.zeros(no_adapter_row + 1, num_keys, dtype=torch.int32)
+            weight_pointers = torch.zeros(no_adapter_row + 1, num_keys, 3, dtype=torch.int64)
+            for row, entries in enumerate(task_entries):
+                if not entries:
+                    continue
+                keys = torch.tensor(list(entries))
+                values = torch.tensor(list(entries.values()), dtype=torch.int64)
+                adapter_sizes[row, keys] = values[:, 0].to(torch.int32)
+                weight_pointers[row, keys] = values[:, 1:]
+            rows = torch.tensor(
+                [task_rows.get(request.lora_task_id, no_adapter_row) for request in request_list]
+            )
+            # One row per (layer_id, module_id): [num_keys, num_requests], [num_keys, 3 * num_requests]
+            adapter_sizes = adapter_sizes[rows].T.contiguous()
+            weight_pointers = weight_pointers[rows].transpose(0, 1).reshape(num_keys, -1)
+            for (layer_id, module_id), sizes, pointers in zip(
+                key_index, adapter_sizes.unbind(), weight_pointers.unbind()
+            ):
+                lora_params.setdefault(layer_id, {})[module_id] = {
+                    "adapter_size": sizes,
+                    "weight_pointers": pointers,
                 }
-
-        for request in request_list:
-            # Need to set default values for this case
-            if request.lora_task_id is None:
-                for layer_id in lora_params:
-                    for module_id in lora_params[layer_id]:
-                        current_lora_params = lora_params[layer_id][module_id]
-                        current_lora_params["adapter_size"].append(0)
-                        current_lora_params["weight_pointers"] += [0, 0, 0]
-
-            else:
-                for layer_id in lora_params:
-                    for module_id in lora_params[layer_id]:
-                        current_tmp_lora_params = tmp_lora_params.get(
-                            (request.py_request_id, layer_id, module_id), None
-                        )
-                        current_lora_params = lora_params[layer_id][module_id]
-                        if current_tmp_lora_params is None:
-                            current_lora_params["adapter_size"].append(0)
-                            current_lora_params["weight_pointers"] += [0, 0, 0]
-                        else:
-                            current_lora_params["adapter_size"] += current_tmp_lora_params[
-                                "adapter_size"
-                            ]
-                            current_lora_params["weight_pointers"] += current_tmp_lora_params[
-                                "weight_pointers"
-                            ]
-
-        for layer_id in lora_params:
-            for module_id in lora_params[layer_id]:
-                current_lora_params = lora_params[layer_id][module_id]
-                current_lora_params["adapter_size"] = torch.IntTensor(
-                    current_lora_params["adapter_size"]
-                )
-                current_lora_params["weight_pointers"] = torch.LongTensor(
-                    current_lora_params["weight_pointers"]
-                )
 
         if lora_params:
             host_request_types = attn_metadata.host_request_types

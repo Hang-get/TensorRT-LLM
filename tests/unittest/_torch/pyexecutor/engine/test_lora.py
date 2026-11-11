@@ -179,6 +179,53 @@ def test_requests_touching_different_modules_take_the_union() -> None:
     assert params[0][2]["weight_pointers"].tolist() == [0, 0, 0, 33, 44, 0]
 
 
+def test_requests_sharing_an_adapter_each_get_its_values_in_batch_order() -> None:
+    """Every request gets its own adapter's values, or zeros, at its position in the batch."""
+    batch = _batch(
+        context=[_request(0, lora_task_id=8), _request(1, lora_task_id=None)],
+        generation=[
+            _request(2, lora_task_id=7),
+            _request(3, lora_task_id=8),
+            _request(4, lora_task_id=7),
+        ],
+    )
+    peft_table = {
+        7: [
+            _module(layer_id=0, module_id=1, adapter_size=4, weights_in=11, weights_out=12),
+            _module(layer_id=1, module_id=1, adapter_size=4, weights_in=13, weights_out=14),
+        ],
+        8: [
+            _module(
+                layer_id=1,
+                module_id=2,
+                adapter_size=6,
+                weights_in=21,
+                weights_out=22,
+                scaling_vec_pointer=23,
+            )
+        ],
+    }
+
+    params = _build(
+        _builder(), batch, _attn_metadata(num_contexts=2, num_generations=3), peft_table
+    )
+
+    assert sorted(params[0]) == [1]
+    assert sorted(params[1]) == [1, 2]
+    expected = {
+        (0, 1): ([0, 0, 4, 0, 4], [0, 0, 0, 0, 0, 0, 11, 12, 0, 0, 0, 0, 11, 12, 0]),
+        (1, 1): ([0, 0, 4, 0, 4], [0, 0, 0, 0, 0, 0, 13, 14, 0, 0, 0, 0, 13, 14, 0]),
+        (1, 2): ([6, 0, 0, 6, 0], [21, 22, 23, 0, 0, 0, 0, 0, 0, 21, 22, 23, 0, 0, 0]),
+    }
+    for (layer_id, module_id), (adapter_sizes, weight_pointers) in expected.items():
+        entry = params[layer_id][module_id]
+        assert entry["adapter_size"].tolist() == adapter_sizes
+        assert entry["weight_pointers"].tolist() == weight_pointers
+        # The LoRA ops read both through data_ptr() as flat per-request arrays.
+        assert entry["adapter_size"].is_contiguous()
+        assert entry["weight_pointers"].is_contiguous()
+
+
 def test_absent_scaling_vector_becomes_a_null_pointer() -> None:
     batch = _batch(context=[_request(0, lora_task_id=7)])
     peft_table = {
