@@ -20,6 +20,8 @@ from typing import List, Optional, Tuple
 
 import torch
 
+from tensorrt_llm._utils import async_tensor_h2d
+
 from ...trtllm import TrtllmAttentionMetadata
 from .common import build_paged_kv_slot_mapping
 
@@ -69,12 +71,13 @@ class MiniMaxM3TritonSparseAttentionMetadata:
         :attr:`max_seqlen_k` without a GPU sync.
     extend_seq_lens_cpu : list[int] or None
         Per-sequence Q-length list (CPU) used by :meth:`prepare` to
-        compute :attr:`max_seqlen_q` for prefill without a GPU sync.
+        compute :attr:`max_seqlen_q` and size :attr:`q_batch_row` for
+        prefill without a GPU sync.
         Ignored for decode (decode always has 1 Q token / sequence).
     q_batch_row : torch.Tensor or None
         ``[total_q_tokens]`` int32, only meaningful for prefill: for
         each Q token, which batch row it belongs to. Built by
-        :meth:`prepare` from ``cu_seqlens_q``.
+        :meth:`prepare` from ``extend_seq_lens_cpu``.
     q_positions : torch.Tensor or None
         ``[total_q_tokens]`` int32, only meaningful for prefill: each
         Q token's K-side position (prefix_lens[b] + offset). Built by
@@ -131,25 +134,20 @@ class MiniMaxM3TritonSparseAttentionMetadata:
                 self.max_seqlen_q = int(max(self.extend_seq_lens_cpu))
 
             if self.q_batch_row is None or self.q_positions is None:
-                # Precompute per-Q-token batch_row + K-side position once,
-                # CPU-side, so the forward path is sync-free.
-                total_q = int(self.cu_seqlens_q[-1].item())
-                cu = self.cu_seqlens_q.to(torch.long).tolist()
-                pref = self.prefix_lens.to(torch.long).tolist()
+                # Precompute per-Q-token batch_row + K-side position once, sized
+                # from the host Q lengths, so neither this nor the forward syncs.
+                total_q = int(sum(self.extend_seq_lens_cpu))
                 device = self.slot_ids.device
-                q_batch_row = torch.empty(total_q, dtype=torch.int32, device=device)
-                q_positions = torch.empty(total_q, dtype=torch.int32, device=device)
-                for b in range(batch_size):
-                    start, end = cu[b], cu[b + 1]
-                    q_batch_row[start:end] = b
-                    offsets = (
-                        torch.arange(start, end, device=device, dtype=torch.int32)
-                        - start
-                        + int(pref[b])
-                    )
-                    q_positions[start:end] = offsets
+                q_batch_row = torch.repeat_interleave(
+                    torch.arange(batch_size, device=device, dtype=torch.int32),
+                    async_tensor_h2d(self.extend_seq_lens_cpu, torch.int64, device),
+                    output_size=total_q,
+                )
+                rows = q_batch_row.to(torch.long)
+                tokens = torch.arange(total_q, device=device, dtype=torch.int32)
+                q_positions = self.prefix_lens[rows] + (tokens - self.cu_seqlens_q[rows])
                 self.q_batch_row = q_batch_row
-                self.q_positions = q_positions
+                self.q_positions = q_positions.to(torch.int32)
             # else: caller (build_runtime_metadata_from_kv_manager with
             # static_buffers) has already populated q_batch_row /
             # q_positions in-place into stable buffers. Do not reallocate.
